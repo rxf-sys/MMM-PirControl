@@ -1,0 +1,24 @@
+{
+  "name": "mmm-pircontrol",
+  "version": "1.0.0",
+  "description": "A MagicMirror² module to control display power via a PIR motion sensor. Supports Debian Bookworm and Trixie with auto-detection.",
+  "main": "MMM-PirControl.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rxf-sys/MMM-PirControl"
+  },
+  "keywords": [
+    "MagicMirror",
+    "PIR",
+    "motion sensor",
+    "display control",
+    "raspberry pi",
+    "smart mirror"
+  ],
+  "author": "rxf-sys",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/rxf-sys/MMM-PirControl/issues"
+  },
+  "homepage": "https://github.com/rxf-sys/MMM-PirControl#readme"
+}
