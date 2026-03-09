@@ -1,5 +1,5 @@
 /* MMM-PirControl - Node Helper
- * Handles PIR sensor GPIO monitoring, HDMI display control, and system suspend.
+ * Handles PIR sensor GPIO monitoring, HDMI display control, and power saving.
  * Auto-detects gpiomon version (Bookworm vs Trixie) and display server.
  *
  * MIT Licensed.
@@ -20,8 +20,7 @@ module.exports = NodeHelper.create({
     this.gpiomonVersion = null;
     this.displayMode = null;
     this.screenOn = true;
-    this.isSuspending = false;
-    this.suspendSupported = false;
+    this.powerSaveActive = false;
   },
 
   stop() {
@@ -35,7 +34,7 @@ module.exports = NodeHelper.create({
         this._initialize();
         break;
       case "SCREEN_ON":
-        this._screenOn();
+        this._wakeUp();
         break;
       case "SCREEN_OFF":
         this._enterPowerSave();
@@ -51,14 +50,6 @@ module.exports = NodeHelper.create({
       this.displayMode = await this._detectDisplayMode();
       this._debug(`Detected display mode: ${this.displayMode}`);
 
-      this.suspendSupported = await this._checkSuspendSupport();
-      this._debug(`Suspend supported: ${this.suspendSupported}`);
-
-      if (this.config.powerSaveMode === "suspend" && !this.suspendSupported) {
-        this._error("Suspend requested but not supported. Falling back to display-off mode.");
-        this._error("Run 'sudo bash setup.sh' in the module directory to configure suspend.");
-      }
-
       if (this.displayMode === "wayland") {
         try {
           await execAsync("which wlr-randr");
@@ -73,27 +64,9 @@ module.exports = NodeHelper.create({
       this.sendSocketNotification("STARTED", {
         displayMode: this.displayMode,
         gpiomonVersion: this.gpiomonVersion,
-        suspendSupported: this.suspendSupported,
       });
     } catch (err) {
       this._error(`Initialization failed: ${err.message}`);
-    }
-  },
-
-  async _checkSuspendSupport() {
-    try {
-      const { stdout } = await execAsync("cat /sys/power/state 2>/dev/null || echo ''");
-      if (!stdout.includes("mem")) return false;
-
-      try {
-        await execAsync("sudo -n -l systemctl suspend 2>/dev/null");
-        return true;
-      } catch {
-        this._debug("sudo systemctl suspend not configured. Run setup.sh first.");
-        return false;
-      }
-    } catch {
-      return false;
     }
   },
 
@@ -148,114 +121,63 @@ module.exports = NodeHelper.create({
   },
 
   // ==========================================
-  // Power Save: Suspend or Display-Off
+  // Power Save: HDMI off + CPU + USB + LEDs
   // ==========================================
 
   async _enterPowerSave() {
-    if (this.isSuspending) return;
+    if (this.powerSaveActive) return;
+    this.powerSaveActive = true;
 
-    const useSuspend =
-      this.config.powerSaveMode === "suspend" && this.suspendSupported;
+    this._debug("Entering power save mode...");
 
-    if (useSuspend) {
-      await this._suspend();
-    } else {
-      await this._screenOff();
-    }
-  },
-
-  async _suspend() {
-    if (this.isSuspending) return;
-    this.isSuspending = true;
-
-    this._debug("Entering suspend mode...");
-
-    // 1. Turn off display first
+    // 1. Turn off display
     await this._displayOff();
 
-    // 2. Kill gpiomon (GPIO will be managed by suspend script)
-    this._killGpiomon();
-
-    // 3. Notify frontend
-    this.screenOn = false;
-    this.sendSocketNotification("SCREEN_STATE", { state: false, suspended: true });
-
-    // 4. Execute suspend script — BLOCKS until system resumes
-    const scriptPath = path.join(__dirname, "scripts", "suspend.sh");
-    const gpioPin = this.config.gpioPin;
-
-    this._debug(`Executing: sudo bash ${scriptPath} ${gpioPin}`);
-
-    try {
-      const { stdout } = await execAsync(
-        `sudo bash "${scriptPath}" ${gpioPin}`,
-        { timeout: 0 }
-      );
-
-      // --- System has resumed ---
-      this._debug(`Resume output: ${stdout.trim()}`);
-      this._debug("System resumed from suspend!");
-
-      // 5. Restart gpiomon
-      this._startGpiomon();
-
-      // 6. Turn on display
-      await this._displayOn();
-
-      // 7. Wait for WiFi reconnection
-      await this._waitForNetwork();
-
-      // 8. Notify frontend
-      this.screenOn = true;
-      this.isSuspending = false;
-      this.sendSocketNotification("SCREEN_STATE", { state: true, resumed: true });
-      this.sendSocketNotification("MOTION_DETECTED");
-    } catch (err) {
-      this._error(`Suspend failed: ${err.message}`);
-      this.isSuspending = false;
-
-      // Recovery: restart everything
-      this._startGpiomon();
-      await this._displayOn();
-      this.screenOn = true;
-      this.sendSocketNotification("SCREEN_STATE", { state: true });
-    }
-  },
-
-  async _waitForNetwork() {
-    this._debug("Waiting for network reconnection...");
-    const maxRetries = 15;
-
-    for (let i = 0; i < maxRetries; i++) {
+    // 2. Activate powersave (CPU, USB, LEDs)
+    if (this.config.powerSaveMode !== "display") {
+      const scriptPath = path.join(__dirname, "scripts", "powersave.sh");
       try {
-        await execAsync("ping -c 1 -W 1 1.1.1.1 2>/dev/null");
-        this._debug(`Network reconnected after ${i + 1}s`);
-        return;
-      } catch {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const { stdout } = await execAsync(`sudo bash "${scriptPath}" on`);
+        this._debug(`Powersave: ${stdout.trim()}`);
+      } catch (err) {
+        this._error(`Powersave script failed: ${err.message}`);
+        this._error("Run 'sudo bash setup.sh' to configure permissions.");
       }
     }
 
-    this._debug("Network reconnection timeout — modules may need a moment to refresh.");
+    // 3. Notify frontend
+    this.screenOn = false;
+    this.sendSocketNotification("SCREEN_STATE", { state: false });
+  },
+
+  async _wakeUp() {
+    if (!this.powerSaveActive && this.screenOn) return;
+
+    this._debug("Waking up from power save...");
+
+    // 1. Deactivate powersave (restore CPU, USB, LEDs)
+    if (this.config.powerSaveMode !== "display") {
+      const scriptPath = path.join(__dirname, "scripts", "powersave.sh");
+      try {
+        const { stdout } = await execAsync(`sudo bash "${scriptPath}" off`);
+        this._debug(`Powersave: ${stdout.trim()}`);
+      } catch (err) {
+        this._error(`Powersave restore failed: ${err.message}`);
+      }
+    }
+
+    // 2. Turn on display
+    await this._displayOn();
+
+    // 3. Notify frontend
+    this.screenOn = true;
+    this.powerSaveActive = false;
+    this.sendSocketNotification("SCREEN_STATE", { state: true });
   },
 
   // ==========================================
   // Display Control
   // ==========================================
-
-  async _screenOn() {
-    if (this.screenOn) return;
-    await this._displayOn();
-    this.screenOn = true;
-    this.sendSocketNotification("SCREEN_STATE", { state: true });
-  },
-
-  async _screenOff() {
-    if (!this.screenOn) return;
-    await this._displayOff();
-    this.screenOn = false;
-    this.sendSocketNotification("SCREEN_STATE", { state: false });
-  },
 
   async _displayOn() {
     const cmd = this._getScreenOnCommand();

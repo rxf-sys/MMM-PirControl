@@ -12,7 +12,7 @@ Module.register("MMM-PirControl", {
     gpioPin: 17,
     timeout: 60 * 1000,
     startScreenOff: false,
-    powerSaveMode: "suspend", // "suspend" (full system suspend) or "display" (HDMI off only)
+    powerSaveMode: "aggressive", // "aggressive" (HDMI+CPU+USB+LEDs off) or "display" (HDMI off only)
     displayMode: "auto",      // "auto", "wayland", "x11", "vcgencmd"
     hdmiPort: "HDMI-A-1",
     debug: false,
