@@ -1,0 +1,25 @@
+{
+  "env": {
+    "browser": true,
+    "node": true,
+    "es2020": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2020,
+    "sourceType": "script"
+  },
+  "globals": {
+    "Module": "readonly",
+    "Log": "readonly",
+    "config": "readonly"
+  },
+  "rules": {
+    "no-unused-vars": ["warn", { "argsIgnorePattern": "^_" }],
+    "no-undef": "error",
+    "no-var": "error",
+    "prefer-const": "warn",
+    "eqeqeq": ["error", "always"],
+    "no-eval": "error",
+    "no-implied-eval": "error"
+  }
+}

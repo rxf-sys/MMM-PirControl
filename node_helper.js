@@ -7,9 +7,12 @@
 
 const NodeHelper = require("node_helper");
 const { exec, spawn } = require("child_process");
+const fs = require("fs");
 const path = require("path");
 const util = require("util");
 const execAsync = util.promisify(exec);
+
+const STATE_FILE = "/tmp/mmm-pircontrol-state.json";
 
 module.exports = NodeHelper.create({
   name: "MMM-PirControl",
@@ -21,6 +24,9 @@ module.exports = NodeHelper.create({
     this.displayMode = null;
     this.screenOn = true;
     this.powerSaveActive = false;
+    this.gpiomonRestartAttempts = 0;
+    this.gpiomonMaxRestarts = 5;
+    this.gpiomonStopping = false;
   },
 
   stop() {
@@ -31,6 +37,7 @@ module.exports = NodeHelper.create({
     switch (notification) {
       case "INIT":
         this.config = payload;
+        if (!this._validateConfig()) return;
         this._initialize();
         break;
       case "SCREEN_ON":
@@ -40,6 +47,39 @@ module.exports = NodeHelper.create({
         this._enterPowerSave();
         break;
     }
+  },
+
+  _validateConfig() {
+    const c = this.config;
+
+    if (!Number.isInteger(c.gpioPin) || c.gpioPin < 0) {
+      this._error(`Invalid gpioPin: ${c.gpioPin}. Must be a non-negative integer.`);
+      return false;
+    }
+
+    if (typeof c.timeout !== "number" || c.timeout <= 0) {
+      this._error(`Invalid timeout: ${c.timeout}. Must be a positive number.`);
+      return false;
+    }
+
+    if (!/^[a-zA-Z0-9_-]+$/.test(c.hdmiPort)) {
+      this._error(`Invalid hdmiPort: ${c.hdmiPort}. Only alphanumeric characters, hyphens, and underscores allowed.`);
+      return false;
+    }
+
+    const validPowerSaveModes = ["aggressive", "display"];
+    if (!validPowerSaveModes.includes(c.powerSaveMode)) {
+      this._error(`Invalid powerSaveMode: ${c.powerSaveMode}. Must be one of: ${validPowerSaveModes.join(", ")}`);
+      return false;
+    }
+
+    const validDisplayModes = ["auto", "wayland", "x11", "vcgencmd"];
+    if (!validDisplayModes.includes(c.displayMode)) {
+      this._error(`Invalid displayMode: ${c.displayMode}. Must be one of: ${validDisplayModes.join(", ")}`);
+      return false;
+    }
+
+    return true;
   },
 
   async _initialize() {
@@ -58,6 +98,9 @@ module.exports = NodeHelper.create({
           return;
         }
       }
+
+      // Recover from previous power-save state (e.g. after MM restart)
+      await this._recoverState();
 
       this._startGpiomon();
 
@@ -121,6 +164,38 @@ module.exports = NodeHelper.create({
   },
 
   // ==========================================
+  // State Persistence
+  // ==========================================
+
+  _saveState() {
+    try {
+      fs.writeFileSync(STATE_FILE, JSON.stringify({
+        powerSaveActive: this.powerSaveActive,
+        screenOn: this.screenOn,
+        timestamp: Date.now(),
+      }));
+    } catch (err) {
+      this._debug(`Could not save state: ${err.message}`);
+    }
+  },
+
+  async _recoverState() {
+    try {
+      if (!fs.existsSync(STATE_FILE)) return;
+      const state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+
+      if (state.powerSaveActive) {
+        this._debug("Recovering from power-save state after restart...");
+        await this._wakeUp();
+      }
+
+      fs.unlinkSync(STATE_FILE);
+    } catch (err) {
+      this._debug(`Could not recover state: ${err.message}`);
+    }
+  },
+
+  // ==========================================
   // Power Save: HDMI off + CPU + USB + LEDs
   // ==========================================
 
@@ -147,6 +222,7 @@ module.exports = NodeHelper.create({
 
     // 3. Notify frontend
     this.screenOn = false;
+    this._saveState();
     this.sendSocketNotification("SCREEN_STATE", { state: false });
   },
 
@@ -172,6 +248,7 @@ module.exports = NodeHelper.create({
     // 3. Notify frontend
     this.screenOn = true;
     this.powerSaveActive = false;
+    this._saveState();
     this.sendSocketNotification("SCREEN_STATE", { state: true });
   },
 
@@ -248,6 +325,7 @@ module.exports = NodeHelper.create({
     });
 
     this.gpiomonProcess.stdout.on("data", (data) => {
+      this.gpiomonRestartAttempts = 0; // Reset on successful data
       const lines = data.toString().trim().split("\n");
       for (const line of lines) {
         if (line.length > 0) {
@@ -264,20 +342,44 @@ module.exports = NodeHelper.create({
 
     this.gpiomonProcess.on("error", (err) => {
       this._error(`gpiomon failed to start: ${err.message}. Is gpiod installed? (sudo apt install gpiod)`);
+      this._scheduleGpiomonRestart();
     });
 
     this.gpiomonProcess.on("close", (code) => {
+      if (this.gpiomonStopping) return;
+
       if (code !== null && code !== 0) {
         this._error(`gpiomon exited with code ${code}. Check your GPIO pin configuration.`);
       }
+      this._scheduleGpiomonRestart();
     });
   },
 
+  _scheduleGpiomonRestart() {
+    if (this.gpiomonStopping) return;
+    if (this.gpiomonRestartAttempts >= this.gpiomonMaxRestarts) {
+      this._error(`gpiomon crashed ${this.gpiomonMaxRestarts} times. Giving up. Check your GPIO configuration and restart MagicMirror.`);
+      return;
+    }
+
+    this.gpiomonRestartAttempts++;
+    const delay = Math.min(2000 * Math.pow(2, this.gpiomonRestartAttempts - 1), 30000);
+    this._debug(`Restarting gpiomon in ${delay}ms (attempt ${this.gpiomonRestartAttempts}/${this.gpiomonMaxRestarts})...`);
+
+    setTimeout(() => {
+      if (!this.gpiomonStopping) {
+        this._startGpiomon();
+      }
+    }, delay);
+  },
+
   _killGpiomon() {
+    this.gpiomonStopping = true;
     if (this.gpiomonProcess) {
       this.gpiomonProcess.kill("SIGTERM");
       this.gpiomonProcess = null;
     }
+    this.gpiomonStopping = false;
   },
 
   // ==========================================
